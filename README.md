@@ -19,6 +19,10 @@
   outcome variable compared to
   other type of chest pains.
 
+## Members
+
+- Haiyue Zhang, Wendy Zheng, Ishaan Bhandari, Kehuan Wang, April Wu
+
 ## Mentor
 
 - Professor Steven A. Culpepper
