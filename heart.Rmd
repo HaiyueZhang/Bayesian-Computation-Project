@@ -1,0 +1,324 @@
+---
+title: "heart"
+author: "Wendy Zheng"
+date: "2023-11-11"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(brms)
+library(rstan)
+library(rjags)
+library(bayestestR)
+library(shinystan)
+```
+
+
+```{r}
+df_heart = read.csv("heart.csv")
+# factor exng, cp, fbs, rest_ecgm, output, slp, caa, thall
+df_heart$exng = as.factor(df_heart$exng)
+df_heart$cp = as.factor(df_heart$cp)
+df_heart$fbs = as.factor(df_heart$fbs)
+df_heart$restecg = as.factor(df_heart$restecg)
+df_heart$output = as.factor(df_heart$output)
+df_heart$slp = as.factor(df_heart$slp)
+df_heart$caa = as.factor(df_heart$caa)
+df_heart$thall = as.factor(df_heart$thall)
+```
+
+The slp column may have categorical values representing these different types of slopes (such as 0 for upsloping, 1 for flat, and 2 for downsloping), but the exact encoding can vary depending on the dataset's specifics. You should refer to the dataset documentation or the source of the dataset for precise definitions of these categories.
+
+```{r}
+summary(df_heart)
+```
+
+
+```{r}
+set.seed(1)
+index = sample(1:nrow(df_heart), 0.7*nrow(df_heart))
+train = df_heart[index,]
+test = df_heart[-index,]
+```
+
+```{r}
+# Logistic Regression model
+model_freq = glm(output~., data = train, family = binomial)
+summary(model_freq)
+```
+
+```{r}
+prediction_freq = predict(model_freq, test, type = "response")
+prediction_freq = ifelse(prediction_freq > 0.5, 1, 0)
+table(prediction_freq, test$output)
+# accuracy of the prediction
+mean(prediction_freq == test$output)
+```
+
+
+```{r}
+# Define priors
+priors <- c(
+  prior(normal(0, 2.5), class = "b"), # Normal prior for coefficients
+  prior(cauchy(0, 2.5), class = "Intercept") # Cauchy prior for the intercept
+)
+
+# Build the Bayesian model
+model_bayes_normal <- brm(
+  formula = output ~ ., 
+  data = train, 
+  family = bernoulli(), 
+  prior = priors,
+  chains = 4, 
+  iter = 2000, 
+  warmup = 500
+)
+# Summary
+summary(model_bayes_normal)
+```
+Translation to Stan Code: brms automatically generates Stan code based on your model specification. This code represents a full probabilistic model, including priors, likelihood, and latent parameters.
+
+Bayesian Inference: Stan uses Hamiltonian Monte Carlo (HMC), a sophisticated Markov Chain Monte Carlo (MCMC) method, to sample from the posterior distribution of the model parameters. This process involves running multiple chains, each performing thousands of iterations to explore the parameter space. and its extension, the No-U-Turn Sampler (NUTS) (Hoffman and Gelman 2014). These algorithms converge much more quickly especially for high-dimensional models regardless of whether the priors are conjugate or not (Hoffman and Gelman 2014).
+
+```{r}
+# Using Brms
+prediction_bayes_normal = predict(model_bayes_normal, test, type = "response")
+prediction_bayes_normal = ifelse(prediction_bayes_normal > 0.5, 1, 0)
+table(prediction_bayes_normal[, "Estimate"], test$output)
+# accuracy of the prediction
+mean(prediction_bayes_normal[, "Estimate"] == test$output)
+```
+
+
+```{r}
+# Modify the data preparation for JAGS
+data_jags <- list(
+  y = as.numeric(levels(train$output))[train$output],
+  X = as.matrix(sapply(train[, -which(names(train) == "output")], as.numeric)),
+  N = nrow(train),
+  K = ncol(train) - 1  # number of predictors
+)
+
+# Define initial values function
+init_values <- function() {
+  list(alpha = 0, beta = rep(0, data_jags$K))
+}
+
+# Specify the path to your model file
+model_file <- "logistic_regression_model.bug"
+
+# Compile the JAGS model
+jags_model <- jags.model(file = model_file, data = data_jags, inits = init_values, n.chains = 4)
+
+# Burn-in period
+update(jags_model, n.iter = 500)
+
+# Run the MCMC sampler
+samples <- coda.samples(jags_model, variable.names = c("alpha", "beta"), n.iter = 2000)
+
+# Print and summarize the samples
+summary(samples)
+```
+
+
+
+```{r}
+# Using Rjags
+# Extract coefficients
+alpha_samples <- do.call(rbind, lapply(samples, function(x) x[, "alpha"]))
+beta_samples <- do.call(rbind, lapply(samples, function(x) x[, grep("beta", colnames(x))]))
+X_test <- as.matrix(sapply(test[, -which(names(test) == "output")], as.numeric))
+# Number of samples
+num_samples <- nrow(alpha_samples)
+# Number of test observations
+num_test_obs <- nrow(X_test)
+
+# Initialize a matrix to store predicted probabilities
+predicted_probs <- matrix(NA, nrow = num_test_obs, ncol = num_samples)
+
+# Compute log-odds for each sample and convert to probabilities
+for (i in 1:num_samples) {
+    log_odds_i <- alpha_samples[i] + X_test %*% beta_samples[i, ]
+    predicted_probs[, i] <- 1 / (1 + exp(-log_odds_i))
+}
+# Average probabilities over all samples
+avg_predicted_probs <- rowMeans(predicted_probs)
+
+# Generate class predictions
+predicted_classes <- ifelse(avg_predicted_probs > 0.5, 1, 0)
+
+# Calculate accuracy
+actual_classes <- as.numeric(levels(test$output))[test$output]
+accuracy <- mean(predicted_classes == actual_classes)
+
+print(paste("Accuracy:", accuracy))
+```
+
+
+
+```{r}
+# Define priors with horseshoe prior for coefficients
+priors <- c(
+  prior(horseshoe(1), class = "b"), # Horseshoe prior for coefficients
+  prior(student_t(1, 0, 2.5), class = "Intercept")  # t distribution prior for the intercept
+)
+
+# Build the Bayesian model with the horseshoe priors
+model_bayes_horseshoe <- brm(
+  formula = output ~ ., 
+  data = train, 
+  family = bernoulli(), 
+  prior = priors,
+  chains = 4, 
+  iter = 5000,  # can consider increasing further if needed
+  warmup = 1500,  # can consider increasing further if needed
+  control = list(adapt_delta = 0.999, max_treedepth = 15)  # increased adapt_delta and max_treedepth
+)
+
+# Summary
+summary(model_bayes_hourseshoe)
+```
+
+```{r}
+prediction_bayes_horseshoe = predict(model_bayes_hourseshoe, test, type = "response")
+prediction_bayes_horseshoe = ifelse(prediction_bayes_horseshoe > 0.5, 1, 0)
+table(prediction_bayes_horseshoe[, "Estimate"], test$output)
+# accuracy of the prediction
+mean(prediction_bayes_horseshoe[, "Estimate"] == test$output)
+```
+
+```{r}
+# RSS
+residuals_freq <- as.numeric(as.character(test$output)) - as.numeric(as.character(prediction_freq))
+residuals_bayes_normal <- as.numeric(as.character(test$output)) - as.numeric(as.character(prediction_bayes_normal[, "Estimate"]))
+residuals_bayes_horseshoe <- as.numeric(as.character(test$output)) - as.numeric(as.character(prediction_bayes_horseshoe[, "Estimate"]))
+
+# Print the RSS
+print(paste("RSS of Rjags model:", sum((actual_classes - avg_predicted_probs)^2)))
+print(paste("RSS of Frequentist model:", sum(residuals_freq^2)))
+print(paste("RSS of bayesian model with normal prior:", sum(residuals_bayes_normal^2)))
+print(paste("RSS of bayesian model with horseshoe prior:", sum(residuals_bayes_horseshoe^2)))
+```
+
+```{r}
+bf = bayesfactor_models(model_bayes_horseshoe, model_null)
+```
+
+
+```{r}
+# Switch Dummy coding to deivation coding for df_heart
+df_heart = read.csv("heart.csv")
+# factor exng, cp, fbs, rest_ecgm, output, slp, caa, thall
+df_heart$exng = as.factor(df_heart$exng)
+df_heart$cp = as.factor(df_heart$cp)
+df_heart$fbs = as.factor(df_heart$fbs)
+df_heart$restecg = as.factor(df_heart$restecg)
+df_heart$output = as.factor(df_heart$output)
+df_heart$slp = as.factor(df_heart$slp)
+df_heart$caa = as.factor(df_heart$caa)
+df_heart$thall = as.factor(df_heart$thall)
+# Splitting data into training and testing sets
+set.seed(1)
+index = sample(1:nrow(df_heart), 0.7*nrow(df_heart))
+train = df_heart[index,]
+test = df_heart[-index,]
+
+# Reapply contrasts immediately before modeling
+contrasts(train$cp) <- contr.sum(4)
+contrasts(train$restecg) <- contr.sum(3)
+contrasts(train$slp) <- contr.sum(3)
+contrasts(train$thall) <- contr.sum(4)
+contrasts(train$caa) <- contr.sum(5)
+```
+
+```{r}
+df_heart
+```
+
+
+```{r}
+# Logistic Regression model
+model_freq = glm(output~., data = train, family = binomial)
+summary(model_frq)
+```
+
+```{r}
+prediction = predict(model_dev, test, type = "response")
+prediction = ifelse(prediction > 0.5, 1, 0)
+table(prediction, test$output)
+# accuracy of the prediction
+mean(prediction == test$output)
+```
+
+```{r}
+# Define priors
+priors <- c(
+  prior(normal(0, 2.5), class = "b"), # Normal prior for coefficients
+  prior(cauchy(0, 2.5), class = "Intercept") # Cauchy prior for the intercept
+)
+
+# Build the Bayesian model
+model_bayes <- brm(
+  formula = output ~ ., 
+  data = train, 
+  family = bernoulli(), 
+  prior = priors,
+  chains = 4, 
+  iter = 2000, 
+  warmup = 500
+)
+# Summary
+summary(model_bayes)
+```
+
+```{r}
+prediction2 = predict(model_bayes, test, type = "response")
+prediction2 = ifelse(prediction2 > 0.5, 1, 0)
+table(prediction2[, "Estimate"], test$output)
+# accuracy of the prediction
+mean(prediction2[, "Estimate"] == test$output)
+```
+
+```{r}
+launch_shinystan(model_bayes_horseshoe)
+```
+
+
+```{r}
+# Define priors with horseshoe prior for coefficients
+priors <- c(
+  prior(horseshoe(1), class = "b"), # Horseshoe prior for coefficients
+  prior(student_t(1, 0, 2.5), class = "Intercept")  # t distribution prior for the intercept
+)
+
+# Build the Bayesian model with the horseshoe priors
+model_bayes_horseshoe <- brm(
+  formula = output ~ ., 
+  data = train, 
+  family = bernoulli(), 
+  prior = priors,
+  chains = 4, 
+  iter = 5000,  # can consider increasing further if needed
+  warmup = 1500,  # can consider increasing further if needed
+  control = list(adapt_delta = 0.999, max_treedepth = 15)  # increased adapt_delta and max_treedepth
+)
+
+# Summary
+summary(model_bayes_hourseshoe)
+```
+
+```{r}
+prediction3 = predict(model_bayes_horseshoe, test, type = "response")
+prediction3 = ifelse(prediction3 > 0.5, 1, 0)
+table(prediction3[, "Estimate"], test$output)
+# accuracy of the prediction
+mean(prediction3[, "Estimate"] == test$output)
+```
+```{r}
+
+```
+

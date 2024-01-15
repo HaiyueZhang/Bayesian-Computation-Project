@@ -1,0 +1,13 @@
+model {
+    # Priors
+    for (i in 1:K) {
+        beta[i] ~ dnorm(0, 1/2.5^2)  # Normal prior for coefficients
+    }
+    alpha ~ dt(0, 1/2.5^2, 1)       
+
+    # Likelihood
+    for (i in 1:N) {
+        logit(p[i]) <- alpha + inprod(beta[], X[i,])
+        y[i] ~ dbern(p[i])
+    }
+}
